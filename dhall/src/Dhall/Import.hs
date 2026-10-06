@@ -192,6 +192,7 @@ import Control.Exception
     , SomeException
     , toException
     )
+import Control.DeepSeq            (rnf)
 import Control.Monad              (foldM, when)
 import Control.Monad.Catch        (MonadCatch (catch), finally, handle, throwM)
 import Control.Monad.IO.Class     (MonadIO (..))
@@ -481,6 +482,13 @@ data LoadResult = LoadOk ImportSemantics | LoadHole ImportHole
 asInlined :: Expr s Void -> Expr s ImportHole
 asInlined = unsafeCoerce
 
+-- | Drop the hole type of an expression that has no hole.
+--
+--   Valid only when the expression contains no 'Embed': the import parameter
+--   is then phantom.  This is the inverse of 'asInlined'.
+holeFree :: Expr s ImportHole -> Expr s Void
+holeFree = unsafeCoerce
+
 -- | Twin used where a hole makes the shared tree unreachable.
 --
 --   Evaluation runs only after every collected import error has been rejected.
@@ -741,15 +749,86 @@ rememberImportBody ref body = do
             when _keepImportBodies
                 (zoom importBodies (State.modify' (Dhall.Map.insert ref body)))
 
--- | Record the twin, after substitutions, when this load will be evaluated
---   through 'normalizeLoaded'.  A plain 'loadWith' skips this.
-rememberSharedTwin :: Chained -> Expr Src ImportRef -> StateT Status IO ()
-rememberSharedTwin chained twinExpr = do
+-- | The value of a resolved import, after substitutions and without notes.
+--
+--   When this load will be evaluated through 'normalizeLoaded', also record
+--   the twin.  The value is then built from the twin: only this file's syntax
+--   is substituted and denoted, and each child reference becomes the child's
+--   value by pointer.  Walking the inlined tree instead would copy every
+--   child at every level of the import graph.  A plain 'loadWith' has no
+--   twin and walks the inlined tree.
+sharedImportValue
+    :: Chained
+    -> Expr Src Void
+    -> Expr Src ImportRef
+    -> StateT Status IO (Expr Void Void)
+sharedImportValue chained resolvedExpr twinExpr = do
     Status { _sharedEvaluation } <- State.get
-    when _sharedEvaluation $ do
-        ref <- ensureImportRef chained
-        substitutedTwin <- applyStatusSubstitutions twinExpr
-        rememberImportBody ref substitutedTwin
+    if not _sharedEvaluation
+        then fmap Core.denote (applyStatusSubstitutions resolvedExpr)
+        else do
+            ref <- ensureImportRef chained
+            -- Strip notes from this file's syntax before substituting, so
+            -- substitution values are shared rather than copied by 'denote',
+            -- and force it so neither the body nor the value keeps the
+            -- parser's source spans alive.
+            let denotedTwin = Core.denote twinExpr :: Expr Void ImportRef
+            _ <- liftIO (Exception.evaluate (rnf denotedTwin))
+            substitutedTwin <- applyStatusSubstitutions (Core.renote denotedTwin)
+            rememberImportBody ref substitutedTwin
+            children <-
+                liftIO
+                    (Exception.evaluate
+                        (LazyIntMap.fromList (childValues twinExpr resolvedExpr)))
+            let lookupValue (ImportRef n) = LazyIntMap.lookup n children
+            liftIO (bindChildren lookupValue (noteFree substitutedTwin))
+
+-- | The value of each child import of a file.
+--
+--   The twin and the inlined expression from one 'resolveImports' call have
+--   the same shape, and where the twin refers to a child, the inlined
+--   expression holds that child's value.
+childValues :: Expr Src ImportRef -> Expr Src Void -> [(Int, Expr Void Void)]
+childValues (Embed (ImportRef n)) value =
+    [(n, noteFree value)]
+childValues twin inlined
+    | null twin =
+        []
+    | length twinChildren /= length inlinedChildren =
+        error "childValues: the twin and the inlined expression differ in shape"
+    | otherwise =
+        concat (zipWith childValues twinChildren inlinedChildren)
+  where
+    twinChildren = toListOf Syntax.subExpressions twin
+
+    inlinedChildren = toListOf Syntax.subExpressions inlined
+
+-- | Replace each import reference by its child's value.
+--
+--   The result is built now, so that each reference holds only its own
+--   child's (unevaluated) value.  A lazy '>>=' with a lookup function would
+--   let every unevaluated part of the value keep all children alive, including
+--   those that normalization has already consumed.  A subterm without a
+--   reference (for example a substituted type) is reused, not copied.
+bindChildren
+    :: (ImportRef -> Maybe (Expr Void Void))
+    -> Expr Void ImportRef
+    -> IO (Expr Void Void)
+bindChildren lookupValue = go
+  where
+    go expression
+        | null expression =
+            return (dropImportRefs expression)
+        | otherwise =
+            Exception.evaluate =<< Syntax.subExpressionsWith onRef go expression
+
+    onRef ref =
+        case lookupValue ref of
+            Just value ->
+                return value
+            Nothing ->
+                Exception.throwIO
+                    (userError "bindChildren: child import has no value")
 
 -- | Replace the shared body.  Hashed imports do this with the normal form.
 replaceImportBody :: ImportRef -> Expr Src ImportRef -> StateT Status IO ()
@@ -757,6 +836,13 @@ replaceImportBody ref body = do
     Status { _keepImportBodies } <- State.get
     when _keepImportBodies
         (zoom importBodies (State.modify' (Dhall.Map.insert ref body)))
+
+-- | Drop the annotation type of an expression that has no 'Note'.
+--
+--   Valid only when the expression contains no 'Note': the annotation
+--   parameter is then phantom.  'Core.denote' would rebuild every node.
+noteFree :: Expr s a -> Expr t a
+noteFree = unsafeCoerce
 
 -- | Reuse an import-free expression as a twin.
 --
@@ -1053,7 +1139,7 @@ bindImports parent =
                     ctx' =
                         Dhall.TypeCheck.extendAlreadyChecked
                             name
-                            (Core.denote typ)
+                            (noteFree typ)
                             (importSemantics sem)
                             ctx
                 State.put (ctx', n + 1)
@@ -1171,30 +1257,26 @@ loadImportWithSemisemanticCache
                             )
 
                 Just SemisemanticWellTyped -> do
-                    substitutedExpr <-
-                        applyStatusSubstitutions
-                            (unsafeCoerce resolvedExpr :: Expr Src Void)
-                    rememberSharedTwin import_ twinExpr
+                    sharedImport <-
+                        sharedImportValue import_ (holeFree resolvedExpr) twinExpr
 
                     return
                         ( LoadOk ImportSemantics
-                            { importSemantics = Core.denote substitutedExpr
+                            { importSemantics = sharedImport
                             , importNormalizationStatus = TypecheckedOnly
                             }
                         )
 
                 -- Missing, corrupt, or NF payload under a custom normalizer: miss path.
                 _ -> do
-                    substitutedExpr <-
-                        applyStatusSubstitutions
-                            (unsafeCoerce resolvedExpr :: Expr Src Void)
-                    rememberSharedTwin import_ twinExpr
+                    sharedImport <-
+                        sharedImportValue import_ (holeFree resolvedExpr) twinExpr
 
                     case Core.shallowDenote parsedImport of
                         Embed _ ->
                             return
                                 ( LoadOk ImportSemantics
-                                    { importSemantics = Core.denote substitutedExpr
+                                    { importSemantics = sharedImport
                                     , importNormalizationStatus = TypecheckedOnly
                                     }
                                 )
@@ -1204,13 +1286,13 @@ loadImportWithSemisemanticCache
                             typ <- case checked of
                                 Just result -> return result
                                 Nothing ->
-                                    case Dhall.TypeCheck.typeWith _startingContext substitutedExpr of
+                                    case Dhall.TypeCheck.typeWith _startingContext (Core.renote sharedImport) of
                                         Right inferred ->
                                             return (Right inferred)
                                         Left _ -> do
                                             annotated <-
                                                 applyAnnotatedSubstitutions
-                                                    (unsafeCoerce resolvedExpr :: Expr Src Void)
+                                                    (holeFree resolvedExpr)
                                             return
                                                 (Dhall.TypeCheck.typeWith
                                                     _startingContext
@@ -1234,7 +1316,7 @@ loadImportWithSemisemanticCache
 
                             return
                                 ( LoadOk ImportSemantics
-                                    { importSemantics = Core.denote substitutedExpr
+                                    { importSemantics = sharedImport
                                     , importNormalizationStatus = TypecheckedOnly
                                     }
                                 )
@@ -2046,8 +2128,8 @@ resolveImports expr₀ = case expr₀ of
             let inlined = asInlined (Core.renote importSemantics)
             if _sharedEvaluation
                 then do
-                    ImportRef n <- ensureImportRef child
-                    return (inlined, Embed (ImportRef n), True)
+                    ref <- ensureImportRef child
+                    return (inlined, Embed ref, True)
                 else return (inlined, retwin inlined, False)
 
 {-

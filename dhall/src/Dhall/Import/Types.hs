@@ -1,4 +1,6 @@
 {-# LANGUAGE CPP               #-}
+{-# LANGUAGE DeriveAnyClass    #-}
+{-# LANGUAGE DeriveGeneric     #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RecordWildCards   #-}
 
@@ -6,6 +8,7 @@
 
 module Dhall.Import.Types where
 
+import Control.DeepSeq                  (NFData (..))
 import Control.Exception                (Exception, SomeException)
 import Control.Monad.Trans.State.Strict (StateT)
 import Data.ByteString                  (ByteString)
@@ -25,6 +28,7 @@ import Dhall.Core
 import Dhall.Crypto                     (SHA256Digest)
 import Dhall.Map                        (Map)
 import Dhall.Parser                     (Src)
+import GHC.Generics                     (Generic)
 import Lens.Micro                       (Lens', lens)
 import Prettyprinter                    (Pretty (..))
 
@@ -43,7 +47,7 @@ import qualified System.Directory   as Directory
 --   The twin expression uses @'Embed' ('ImportRef' n)@ at each use site.
 --   'Dhall.Import.normalizeLoaded' resolves every reference to one thunk.
 newtype ImportRef = ImportRef Int
-    deriving (Eq, Ord, Show)
+    deriving (Eq, Ord, Show, Generic, NFData)
 
 -- | A failed import in a collected expression.
 --
